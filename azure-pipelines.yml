@@ -1,86 +1,109 @@
-trigger:
-- main
-
-resources:
-- repo: self
-
-variables:
-  imageRepo: sampleapp
-  tag: '$(Build.BuildId)'
+trigger: none
+variables: 
+  - name: storage_resource_Group
+    value: lab
+  - name: strg_account_name
+    value: terraformstatestrg1
+  - name: strg_containerName
+    value: terraform
+  - name: tf_state_file_name
+    value: myfirst.tfstate  
+  - name: service_connection_name 
+    value: myconn1
+pool:
+  vmimage: 'ubuntu-latest'
 
 stages:
-- stage: Build
-  displayName: Build image
+- stage: Terraform_plan_stage 
+  displayName: EastUs Location_resources deployement terraform Plan stage 
+  jobs: 
+    - job: Resources_Deployment 
+      steps: 
+      - task: TerraformInstaller@0
+        displayName: 'Terraform Install'
+        inputs:
+          terraformVersion: 'Latest'
+
+      - task: TerraformTaskV3@3
+        displayName: 'Terraform init step'
+        inputs:
+          workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+          backendServiceArm: '$(service_connection_name)'
+          backendAzureRmResourceGroupName: '$(storage_resource_Group)'
+          backendAzureRmStorageAccountName: '$(strg_account_name)'
+          backendAzureRmContainerName: '$(strg_containerName)'
+          backendAzureRmKey: '$(tf_state_file_name)'
+
+      - task: TerraformTaskV3@3
+        displayName: 'Terraform plan step'
+        inputs:
+          provider: 'azurerm'
+          command: 'plan'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+          commandOptions: '-out=tfplan'
+          environmentServiceNameAzureRM: '$(service_connection_name)'
+      - script: |
+          cd $(System.DefaultWorkingDirectory)/infrastructure
+          terraform show -json tfplan >> tfplan.json
+          # Format tfplan.json file
+          terraform show -json tfplan | jq '.' > tfplan.json
+          # show only the changes
+          cat tfplan.json | jq '[.resource_changes[] | {type: .type, name: .change.after.name, actions: .change.actions[]}]' 
+        displayName: Create tfplan.json
+
+      - task: PublishBuildArtifacts@1
+        displayName: Upload tfplan
+        inputs:
+          PathtoPublish: '$(System.DefaultWorkingDirectory)/infrastructure'
+          ArtifactName: '$(Build.BuildId)_tfplan'
+          publishLocation: 'Container'
+
+- stage: Terraform_Apply_Stage_with_Approval
+  displayName: Terraform_Apply_Stage_with_Manual_Approval
   jobs:
-  - job: Build
-    displayName: Build
-    pool:
-      vmImage: ubuntu-latest
-    steps:
-    - task: Docker@2
-      displayName: Build an image
-      inputs:
-        containerRegistry: 'K8SExamplesACR'
-        repository: '$(imageRepo)'
-        command: 'buildAndPush'
-        Dockerfile: '$(Build.SourcesDirectory)/app/Dockerfile'
-        tags: |
-          $(tag)
-    - task: PublishPipelineArtifact@1
-      inputs:
-        targetPath: '$(Pipeline.Workspace)/s/kubernetes'
-        artifact: 'manifests'
-        publishLocation: 'pipeline'
-        
-- stage: Deploy
-  displayName: Deploy to Dev
-  dependsOn: Build
-  variables:
-    acrsecret: k8sexamplesacrauth
-    acrdevurl: 'k8sexamplesacr.azurecr.io'
-    replicaNo: 3
-  jobs:
-  - deployment: Deploy
-    displayName: Deploy to AKS
-    environment: 'k8sdev.default'
-    pool: 
-      vmImage: ubuntu-latest
-    strategy:
-      runOnce:
-        deploy:
-          steps:
-          - task: DownloadPipelineArtifact@2
-            inputs:
-              buildType: 'current'
-              artifactName: 'manifests'
-              targetPath: '$(Pipeline.Workspace)/manifests'
-          - task: KubernetesManifest@0
-            inputs:
-              action: 'createSecret'
-              namespace: 'default'
-              secretType: 'dockerRegistry'
-              secretName: '$(acrsecret)'
-              dockerRegistryEndpoint: 'K8SExamplesACR'
-          - task: replacetokens@3
-            displayName: Replace Tokens
-            inputs:
-              rootDirectory: '$(Pipeline.Workspace)/manifests/'
-              targetFiles: 'deployment.yml'
-              encoding: 'auto'
-              writeBOM: true
-              actionOnMissing: 'warn'
-              keepToken: false
-              tokenPrefix: '#'
-              tokenSuffix: '#'
-              useLegacyPattern: false
-              enableTransforms: false
-              enableTelemetry: true
-          - task: KubernetesManifest@0
-            inputs:
-              action: 'deploy'
-              namespace: 'default'
-              manifests: |
-                $(Pipeline.Workspace)/manifests/deployment.yml
-                $(Pipeline.Workspace)/manifests/service.yml
-              containers: '$(acrdevurl)/$(imageRepo):$(tag)'
-              imagePullSecrets: '$(acrsecret)'
+    - deployment: Resources_Deployment
+      environment: test 
+      strategy: 
+        runOnce:
+          deploy:
+            steps:
+            - checkout: self 
+
+            - task: DownloadBuildArtifacts@0
+              displayName: Download tfplan
+              inputs:
+                buildType: 'current'
+                downloadType: 'specific'
+                itemPattern: '$(Build.BuildId)_tfplan/tfplan'
+                downloadPath: '$(System.ArtifactsDirectory)'
+
+            - task: CopyFiles@2
+              displayName: Copy tfplan
+              inputs:
+                SourceFolder: '$(System.DefaultWorkingDirectory)/infrastructure/$(Build.BuildId)_tfplan/tfplan'
+                Contents: 'tfplan'
+                TargetFolder: '$(System.DefaultWorkingDirectory)'
+
+            - task: TerraformInstaller@0
+              displayName: 'Terraform Install'
+              inputs:
+                terraformVersion: 'Latest'
+
+            - task: TerraformTaskV3@3
+              displayName: 'Terraform init step'
+              inputs:
+                workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+                backendServiceArm: '$(service_connection_name)'
+                backendAzureRmResourceGroupName: '$(storage_resource_Group)'
+                backendAzureRmStorageAccountName: '$(strg_account_name)'
+                backendAzureRmContainerName: '$(strg_containerName)'
+                backendAzureRmKey: '$(tf_state_file_name)'
+
+            - task: TerraformTaskV2@2
+              displayName: 'terraform apply step'
+              inputs:
+                provider: 'azurerm'
+                command: 'apply'
+                workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+                commandOptions: 'tfplan'
+                environmentServiceNameAzureRM: '$(service_connection_name)'    
